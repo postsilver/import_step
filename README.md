@@ -10,7 +10,7 @@
 - Updated default FreeCADCmd paths for macOS, Windows, and Linux
 - Various improvements and bug fixes
 
-[See full release notes](https://github.com/postsilver/import_step/releases/tag/v1.1.0)
+[See full release notes](https://github.com/postsilver/import_step/releases/tag/v1.1)
 
 
 ---
