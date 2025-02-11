@@ -5,12 +5,12 @@
 
 📌 **A Blender add-on that enables importing CAD STEP files (`.step` / `.stp`) by converting them to STL using FreeCAD.**  
 
-## Latest Release: v1.1.0
+## Latest Release: v1.1.2
 - Added OS detection using `platform.system()`
 - Updated default FreeCADCmd paths for macOS, Windows, and Linux
 - Various improvements and bug fixes
 
-[See full release notes](https://github.com/postsilver/import_step/releases/tag/v1.1)
+[DOWNLOAD HERE](https://github.com/postsilver/import_step/releases/tag/v1.1.2)
 
 
 ---
