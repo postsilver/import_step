@@ -22,7 +22,7 @@ from bpy.types import Operator, AddonPreferences, FileHandler
 bl_info = {
     "name": "CAD Importer (STEP/IGES)",
     "author": "posthuman",
-    "version": (2, 0, 3),
+    "version": (2, 0, 2),
     "blender": (4, 2, 0),
     "location": "File > Import > CAD Files (.step/.stp/.iges/.igs)",
     "description": "Import CAD STEP and IGES files via FreeCAD",
@@ -60,7 +60,7 @@ def find_freecad_automatically():
     
     if system == "Windows":
         candidates = [
-            # FreeCAD 1.x (newest) - FIXED: was missing .exe extension
+            # FreeCAD 1.x (newest)
             r"C:\Program Files\FreeCAD 1.0\bin\freecadcmd.exe",
             # FreeCAD 0.2x
             r"C:\Program Files\FreeCAD 0.21\bin\FreeCADCmd.exe",
@@ -68,10 +68,12 @@ def find_freecad_automatically():
             r"C:\Program Files\FreeCAD\bin\FreeCADCmd.exe",
             r"C:\Program Files (x86)\FreeCAD\bin\FreeCADCmd.exe",
         ]
-        # Check PATH
-        path_result = shutil.which("freecadcmd") or shutil.which("FreeCADCmd")
-        if path_result:
-            candidates.insert(0, path_result)
+        # Check PATH - try multiple variations
+        for cmd in ["freecadcmd", "FreeCADCmd", "freecad"]:
+            path_result = shutil.which(cmd)
+            if path_result:
+                candidates.insert(0, path_result)
+                break
         # Check AppData for user installs
         appdata = os.environ.get('LOCALAPPDATA', '')
         if appdata:
@@ -84,9 +86,11 @@ def find_freecad_automatically():
             "/opt/homebrew/bin/freecadcmd",
             "/usr/local/bin/freecadcmd",
         ]
-        path_result = shutil.which("freecadcmd") or shutil.which("FreeCADCmd")
-        if path_result:
-            candidates.insert(0, path_result)
+        for cmd in ["freecadcmd", "FreeCADCmd", "freecad"]:
+            path_result = shutil.which(cmd)
+            if path_result:
+                candidates.insert(0, path_result)
+                break
     else:  # Linux
         candidates = [
             "/usr/bin/freecadcmd",
@@ -94,9 +98,11 @@ def find_freecad_automatically():
             "/usr/local/bin/freecadcmd",
             "/snap/freecad/current/usr/bin/freecadcmd",
         ]
-        path_result = shutil.which("freecadcmd") or shutil.which("FreeCADCmd")
-        if path_result:
-            candidates.insert(0, path_result)
+        for cmd in ["freecadcmd", "FreeCADCmd", "freecad"]:
+            path_result = shutil.which(cmd)
+            if path_result:
+                candidates.insert(0, path_result)
+                break
     
     for path in candidates:
         if os.path.isfile(path):
@@ -280,25 +286,62 @@ class CAD_OT_ImportCAD(Operator, ImportHelper):
             print(f"Running FreeCAD: {freecad_path}")
             print(f"Script: {script_path}")
             
-            try:
-                result = subprocess.run(
+            # CRITICAL FIX: Proper command-line invocation for different platforms
+            # Try different invocation methods for compatibility
+            commands_to_try = []
+            
+            if platform.system() == "Windows":
+                # Windows: Most accept script directly, but some need flags
+                commands_to_try = [
                     [freecad_path, script_path],
-                    capture_output=True,
-                    text=True,
-                    timeout=300,
-                )
-                
-                print(f"FreeCAD stdout:\n{result.stdout}")
-                if result.stderr:
-                    print(f"FreeCAD stderr:\n{result.stderr}")
-                print(f"Return code: {result.returncode}")
-                
-            except subprocess.TimeoutExpired:
-                self.report({'ERROR'}, "FreeCAD conversion timed out")
+                    [freecad_path, "-c", script_path],
+                ]
+            else:
+                # Linux/macOS: Usually need -c flag
+                commands_to_try = [
+                    [freecad_path, "-c", script_path],
+                    [freecad_path, script_path],
+                ]
+            
+            result = None
+            last_error = None
+            
+            for cmd in commands_to_try:
+                try:
+                    print(f"Trying command: {' '.join(cmd)}")
+                    result = subprocess.run(
+                        cmd,
+                        capture_output=True,
+                        text=True,
+                        timeout=600,  # 10 minutes for large assemblies
+                    )
+                    
+                    # Check if it worked (return code 0 or output contains SUCCESS)
+                    if result.returncode == 0 or "SUCCESS" in result.stdout:
+                        print(f"Command succeeded!")
+                        break
+                    else:
+                        last_error = f"Command failed with return code {result.returncode}"
+                        print(f"Command failed, trying next variant...")
+                        
+                except subprocess.TimeoutExpired:
+                    self.report({'ERROR'}, "FreeCAD conversion timed out (10 min limit)")
+                    return False
+                except FileNotFoundError:
+                    self.report({'ERROR'}, f"FreeCAD not found: {freecad_path}")
+                    return False
+                except Exception as e:
+                    last_error = str(e)
+                    continue
+            
+            if result is None:
+                self.report({'ERROR'}, f"All FreeCAD invocation methods failed: {last_error}")
                 return False
-            except FileNotFoundError:
-                self.report({'ERROR'}, f"FreeCAD not found: {freecad_path}")
-                return False
+            
+            print(f"FreeCAD stdout:\n{result.stdout}")
+            if result.stderr:
+                print(f"FreeCAD stderr:\n{result.stderr}")
+            print(f"Return code: {result.returncode}")
             
             # Import based on mode
             if self.preserve_hierarchy:
@@ -340,6 +383,10 @@ try:
     print("Tessellating...")
     mesh = Mesh.Mesh(shape.tessellate(deflection))
     print(f"Mesh created: {{mesh.CountFacets}} faces, {{mesh.CountPoints}} vertices")
+    
+    if mesh.CountFacets == 0:
+        print("ERROR: Tessellation produced empty mesh")
+        sys.exit(1)
     
     print("Exporting to STL...")
     mesh.write(output_path)
@@ -388,14 +435,26 @@ def sanitize_name(name):
     name = name.strip()
     return name if name else "unnamed"
 
-def process_object(obj, parent_path="", hierarchy=None, obj_counter=None):
+def process_object(obj, parent_path="", hierarchy=None, obj_counter=None, name_counts=None):
     """Recursively process objects and build hierarchy."""
     if hierarchy is None:
         hierarchy = []
     if obj_counter is None:
         obj_counter = {{'count': 0}}
+    if name_counts is None:
+        name_counts = {{}}
     
-    obj_name = sanitize_name(obj.Label if hasattr(obj, 'Label') else f"object_{{obj_counter['count']}}")
+    # Generate unique name
+    base_name = sanitize_name(obj.Label if hasattr(obj, 'Label') else f"object_{{obj_counter['count']}}")
+    
+    # Add numeric suffix if name already used
+    if base_name in name_counts:
+        name_counts[base_name] += 1
+        obj_name = f"{{base_name}}_{{name_counts[base_name]}}"
+    else:
+        name_counts[base_name] = 0
+        obj_name = base_name
+    
     obj_id = f"{{parent_path}}/{{obj_name}}" if parent_path else obj_name
     
     print(f"Processing: {{obj_id}}")
@@ -420,8 +479,14 @@ def process_object(obj, parent_path="", hierarchy=None, obj_counter=None):
             if mesh.CountFacets > 0:
                 print(f"  Writing {{mesh.CountFacets}} faces to {{filename}}")
                 mesh.write(filepath)
-                node['mesh_file'] = filename
-                node['has_geometry'] = True
+                
+                # Verify file was written and has size > 0
+                if os.path.exists(filepath) and os.path.getsize(filepath) > 0:
+                    node['mesh_file'] = filename
+                    node['has_geometry'] = True
+                else:
+                    print(f"  Warning: STL file is empty or wasn't created")
+                    node['has_geometry'] = False
             else:
                 print(f"  Skipping empty mesh")
                 node['has_geometry'] = False
@@ -434,7 +499,7 @@ def process_object(obj, parent_path="", hierarchy=None, obj_counter=None):
     # Process children
     if hasattr(obj, 'OutList'):
         for child in obj.OutList:
-            child_node = process_object(child, obj_id, None, obj_counter)
+            child_node = process_object(child, obj_id, None, obj_counter, name_counts)
             if child_node:
                 node['children'].append(child_node)
     
@@ -456,18 +521,30 @@ try:
     # Build hierarchy
     hierarchy = []
     obj_counter = {{'count': 0}}
+    name_counts = {{}}
     
-    # Process root objects
+    # CRITICAL FIX: Better root object detection
+    # Method 1: Find objects with no incoming dependencies
+    roots = []
     for obj in doc.Objects:
-        # Only process root level objects (not referenced by others)
-        is_root = True
-        for other in doc.Objects:
-            if hasattr(other, 'OutList') and obj in other.OutList:
-                is_root = False
-                break
-        
-        if is_root:
-            process_object(obj, "", hierarchy, obj_counter)
+        # Check if object has no incoming links (is a root)
+        if hasattr(obj, "InList") and len(obj.InList) == 0:
+            roots.append(obj)
+        # Also include known top-level container types
+        elif hasattr(obj, "TypeId") and obj.TypeId in {{"App::Part", "PartDesign::Body", "App::Link", "Part::Compound"}}:
+            # But only if not already in roots
+            if obj not in roots:
+                roots.append(obj)
+    
+    # Fallback: if no roots found, process all objects
+    if not roots:
+        print("Warning: No clear root objects found, processing all objects")
+        roots = doc.Objects
+    
+    print(f"Processing {{len(roots)}} root objects")
+    
+    for obj in roots:
+        process_object(obj, "", hierarchy, obj_counter, name_counts)
     
     # Save hierarchy to JSON
     hierarchy_path = os.path.join(output_dir, "hierarchy.json")
@@ -494,6 +571,11 @@ print("SUCCESS")
         
         if not os.path.exists(output_path):
             self.report({'ERROR'}, "Conversion failed - no output file created")
+            return False
+        
+        # Check file size
+        if os.path.getsize(output_path) == 0:
+            self.report({'ERROR'}, "Conversion produced empty file")
             return False
         
         print(f"Importing STL: {output_path}")
@@ -544,16 +626,28 @@ print("SUCCESS")
         collection = bpy.data.collections.new(f"CAD_{filename}")
         bpy.context.scene.collection.children.link(collection)
         
+        # Track used names to ensure uniqueness
+        used_names = set()
+        
         # Import hierarchy recursively
         def import_node(node, parent_collection):
             """Recursively import nodes and create hierarchy."""
             node_collection = None
+            node_name = node['name']
+            
+            # Ensure unique name in Blender
+            original_name = node_name
+            counter = 1
+            while node_name in used_names:
+                node_name = f"{original_name}_{counter}"
+                counter += 1
+            used_names.add(node_name)
             
             # Import mesh if exists
             if node.get('has_geometry') and node.get('mesh_file'):
                 mesh_path = os.path.join(temp_dir, node['mesh_file'])
                 
-                if os.path.exists(mesh_path):
+                if os.path.exists(mesh_path) and os.path.getsize(mesh_path) > 0:
                     # Track existing objects
                     before = set(bpy.data.objects)
                     
@@ -566,7 +660,7 @@ print("SUCCESS")
                     
                     if new_objects:
                         obj = new_objects[0]
-                        obj.name = node['name']
+                        obj.name = node_name
                         
                         # Apply smooth shading
                         if self.smooth_shading and obj.type == 'MESH':
@@ -585,7 +679,7 @@ print("SUCCESS")
             
             # Create collection for children if needed
             if node.get('children'):
-                node_collection = bpy.data.collections.new(node['name'])
+                node_collection = bpy.data.collections.new(node_name)
                 parent_collection.children.link(node_collection)
                 
                 # Process children
