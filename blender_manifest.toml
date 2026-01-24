@@ -2,57 +2,13 @@ schema_version = "1.0.0"
 
 id = "cad_importer"
 name = "CAD Importer (STEP/IGES)"
-version = "2.0.0"
-tagline = "Import CAD STEP and IGES files with hierarchy preservation"
+version = "2.0.2"
+tagline = "Import CAD STEP and IGES files via FreeCAD"
 maintainer = "posthuman <postsilver@github>"
 type = "add-on"
 
-# Blender version requirements
 blender_version_min = "4.2.0"
-blender_version_max = "4.9.0"
 
-# Website and documentation
 website = "https://github.com/postsilver/import_step"
-
-# License
 license = ["SPDX:GPL-3.0-or-later"]
-
-# Category for the addon
 tags = ["Import-Export"]
-
-# Permissions (no special permissions required)
-# permissions = []
-
-# Description
-[description]
-text = """
-CAD Importer for Blender - Import STEP and IGES files directly into Blender using FreeCAD as a conversion backend.
-
-**Features:**
-- Import STEP (.step, .stp) and IGES (.iges, .igs) files
-- Preserve part hierarchy and names
-- Quality presets (Draft, Standard, High, Ultra) for mesh detail control
-- Drag-and-drop support in the 3D viewport
-- Auto-detection of FreeCAD installation
-- Cross-platform support (Windows, macOS, Linux)
-
-**Requirements:**
-- FreeCAD 0.20 or newer (free download at freecad.org)
-
-**Installation:**
-1. Install FreeCAD from https://www.freecad.org
-2. Install this extension in Blender
-3. Go to Preferences > Add-ons > CAD Importer to verify FreeCAD path
-4. Use File > Import > CAD Files or drag files into the 3D viewport
-"""
-
-# Build configuration
-[build]
-paths_exclude_pattern = [
-    "__pycache__/",
-    "*.pyc",
-    ".git/",
-    ".gitignore",
-    "*.md",
-    "tests/",
-]

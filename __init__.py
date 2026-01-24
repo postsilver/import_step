@@ -1,39 +1,32 @@
 """
 CAD Importer for Blender
-Import STEP and IGES files using FreeCAD conversion with hierarchy and color preservation.
+Import STEP and IGES files using FreeCAD conversion.
 
 Author: posthuman (postsilver)
 License: GPL-3.0
 Repository: https://github.com/postsilver/import_step
 """
 
-from __future__ import annotations
-
 import bpy
 import os
 import subprocess
 import tempfile
 import platform
-import threading
-import json
-import re
 from pathlib import Path
-from typing import Set, Optional, Any
-from dataclasses import dataclass
 
 from bpy_extras.io_utils import ImportHelper
 from bpy.props import StringProperty, FloatProperty, EnumProperty, BoolProperty
-from bpy.types import Operator, AddonPreferences, FileHandler, Context
+from bpy.types import Operator, AddonPreferences, FileHandler
 
 
 bl_info = {
     "name": "CAD Importer (STEP/IGES)",
     "author": "posthuman",
-    "version": (2, 0, 0),
+    "version": (2, 0, 3),
     "blender": (4, 2, 0),
     "location": "File > Import > CAD Files (.step/.stp/.iges/.igs)",
-    "description": "Import CAD STEP and IGES files with hierarchy and color preservation via FreeCAD",
-    "warning": "Requires FreeCAD 0.20+ installed",
+    "description": "Import CAD STEP and IGES files via FreeCAD",
+    "warning": "Requires FreeCAD installed",
     "doc_url": "https://github.com/postsilver/import_step",
     "tracker_url": "https://github.com/postsilver/import_step/issues",
     "category": "Import-Export",
@@ -41,16 +34,17 @@ bl_info = {
 
 
 # =============================================================================
-# Constants & Configuration
+# Constants
 # =============================================================================
 
 SUPPORTED_EXTENSIONS = {".step", ".stp", ".iges", ".igs"}
 
+# Quality presets: (deflection_value, description)
 QUALITY_PRESETS = {
-    'DRAFT':    (1.0,    "Fast preview, low detail"),
-    'STANDARD': (0.1,    "Balanced quality and speed"),
-    'HIGH':     (0.01,   "High detail, slower conversion"),
-    'ULTRA':    (0.001,  "Maximum detail, very slow"),
+    'DRAFT':    1.0,
+    'STANDARD': 0.1,
+    'HIGH':     0.01,
+    'ULTRA':    0.001,
 }
 
 
@@ -58,50 +52,48 @@ QUALITY_PRESETS = {
 # Utility Functions
 # =============================================================================
 
-def get_default_freecad_path() -> str:
-    """Return the default FreeCADCmd path based on the operating system."""
-    system = platform.system()
-    paths = {
-        "Windows": r"C:\Program Files\FreeCAD 0.21\bin\FreeCADCmd.exe",
-        "Darwin": "/Applications/FreeCAD.app/Contents/MacOS/FreeCADCmd",
-        "Linux": "/usr/bin/freecadcmd",
-    }
-    return paths.get(system, "freecadcmd")
-
-
-def find_freecad_automatically() -> Optional[str]:
+def find_freecad_automatically():
     """Attempt to find FreeCAD installation automatically."""
+    import shutil
+    
     system = platform.system()
     
     if system == "Windows":
-        # Check common installation paths
         candidates = [
+            # FreeCAD 1.x (newest) - FIXED: was missing .exe extension
+            r"C:\Program Files\FreeCAD 1.0\bin\freecadcmd.exe",
+            # FreeCAD 0.2x
             r"C:\Program Files\FreeCAD 0.21\bin\FreeCADCmd.exe",
             r"C:\Program Files\FreeCAD 0.20\bin\FreeCADCmd.exe",
             r"C:\Program Files\FreeCAD\bin\FreeCADCmd.exe",
             r"C:\Program Files (x86)\FreeCAD\bin\FreeCADCmd.exe",
         ]
-        # Also check PATH
-        import shutil
-        path_result = shutil.which("FreeCADCmd.exe")
+        # Check PATH
+        path_result = shutil.which("freecadcmd") or shutil.which("FreeCADCmd")
         if path_result:
             candidates.insert(0, path_result)
+        # Check AppData for user installs
+        appdata = os.environ.get('LOCALAPPDATA', '')
+        if appdata:
+            candidates.append(os.path.join(appdata, "Programs", "FreeCAD", "bin", "FreeCADCmd.exe"))
             
     elif system == "Darwin":
         candidates = [
             "/Applications/FreeCAD.app/Contents/MacOS/FreeCADCmd",
-            "/Applications/FreeCAD_0.21.app/Contents/MacOS/FreeCADCmd",
+            "/Applications/FreeCAD.app/Contents/Resources/bin/FreeCADCmd",
             "/opt/homebrew/bin/freecadcmd",
             "/usr/local/bin/freecadcmd",
         ]
+        path_result = shutil.which("freecadcmd") or shutil.which("FreeCADCmd")
+        if path_result:
+            candidates.insert(0, path_result)
     else:  # Linux
         candidates = [
             "/usr/bin/freecadcmd",
+            "/usr/bin/FreeCADCmd",
             "/usr/local/bin/freecadcmd",
             "/snap/freecad/current/usr/bin/freecadcmd",
-            "/var/lib/flatpak/exports/bin/org.freecadweb.FreeCAD",
         ]
-        import shutil
         path_result = shutil.which("freecadcmd") or shutil.which("FreeCADCmd")
         if path_result:
             candidates.insert(0, path_result)
@@ -112,211 +104,23 @@ def find_freecad_automatically() -> Optional[str]:
     return None
 
 
-def escape_path_for_python(path: str) -> str:
-    """Safely escape a file path for embedding in Python code."""
-    # Use repr() to handle all special characters, then strip outer quotes
-    return repr(str(path))
-
-
-def get_quality_items(self, context) -> list:
-    """Generate quality preset enum items."""
-    return [
-        ('DRAFT', "Draft", QUALITY_PRESETS['DRAFT'][1], 'MESH_PLANE', 0),
-        ('STANDARD', "Standard", QUALITY_PRESETS['STANDARD'][1], 'MESH_GRID', 1),
-        ('HIGH', "High", QUALITY_PRESETS['HIGH'][1], 'MESH_ICOSPHERE', 2),
-        ('ULTRA', "Ultra", QUALITY_PRESETS['ULTRA'][1], 'MESH_UVSPHERE', 3),
-        ('CUSTOM', "Custom", "Use custom deflection value", 'PREFERENCES', 4),
-    ]
-
-
-# =============================================================================
-# FreeCAD Conversion Script Generator
-# =============================================================================
-
-def generate_freecad_script(
-    input_path: str,
-    output_path: str,
-    deflection: float,
-    export_format: str = 'GLTF',
-    preserve_hierarchy: bool = True,
-) -> str:
-    """
-    Generate a FreeCAD Python script for CAD conversion.
-    
-    Uses glTF or OBJ export to preserve part hierarchy and colors.
-    """
-    
-    input_escaped = escape_path_for_python(input_path)
-    output_escaped = escape_path_for_python(output_path)
-    
-    script = f'''# FreeCAD conversion script - generated by CAD Importer for Blender
-import sys
-import json
-
-try:
-    import FreeCAD
-    import Part
-    import Mesh
-    import MeshPart
-    import Import
-except ImportError as e:
-    print(f"FREECAD_ERROR: Failed to import FreeCAD modules: {{e}}", file=sys.stderr)
-    sys.exit(1)
-
-def convert_cad_file():
-    input_path = {input_escaped}
-    output_path = {output_escaped}
-    deflection = {deflection}
-    
-    # Create a new document
-    doc = FreeCAD.newDocument("CADImport")
-    
-    try:
-        # Import the CAD file (works for both STEP and IGES)
-        Import.insert(input_path, doc.Name)
-    except Exception as e:
-        print(f"FREECAD_ERROR: Failed to read CAD file: {{e}}", file=sys.stderr)
-        sys.exit(1)
-    
-    if not doc.Objects:
-        print("FREECAD_ERROR: No objects found in CAD file", file=sys.stderr)
-        sys.exit(1)
-    
-    # Collect info about parts for logging
-    part_info = []
-    meshes_to_export = []
-    
-    for obj in doc.Objects:
-        if hasattr(obj, 'Shape') and obj.Shape:
-            shape = obj.Shape
-            
-            # Get color if available
-            color = None
-            if hasattr(obj, 'ViewObject') and obj.ViewObject:
-                if hasattr(obj.ViewObject, 'ShapeColor'):
-                    c = obj.ViewObject.ShapeColor
-                    color = [c[0], c[1], c[2], 1.0]
-            
-            # Create mesh from shape
-            try:
-                mesh_data = MeshPart.meshFromShape(
-                    Shape=shape,
-                    LinearDeflection=deflection,
-                    AngularDeflection=0.5,
-                    Relative=False
-                )
-            except Exception:
-                # Fallback to basic tessellation
-                mesh_data = Mesh.Mesh(shape.tessellate(deflection))
-            
-            # Create mesh object
-            mesh_obj = doc.addObject("Mesh::Feature", obj.Label or "Part")
-            mesh_obj.Mesh = mesh_data
-            meshes_to_export.append(mesh_obj)
-            
-            part_info.append({{
-                "name": obj.Label,
-                "faces": mesh_data.CountFacets,
-                "vertices": mesh_data.CountPoints,
-            }})
-    
-    # Export based on format
-    export_format = {repr(export_format)}
-    
-    if export_format == 'GLTF':
-        # Export as glTF (preserves hierarchy better)
-        # FreeCAD's glTF export requires the mesh objects
-        try:
-            import importlib
-            # Try to use the glTF exporter if available
-            if hasattr(Mesh, 'export'):
-                Mesh.export(meshes_to_export, output_path)
-            else:
-                # Fallback: export as OBJ
-                output_path = output_path.replace('.glb', '.obj').replace('.gltf', '.obj')
-                Mesh.export(meshes_to_export, output_path)
-        except Exception as e:
-            print(f"FREECAD_ERROR: Export failed: {{e}}", file=sys.stderr)
-            sys.exit(1)
-    else:
-        # Export as OBJ (good hierarchy support)
-        try:
-            Mesh.export(meshes_to_export, output_path)
-        except Exception as e:
-            print(f"FREECAD_ERROR: Export failed: {{e}}", file=sys.stderr)
-            sys.exit(1)
-    
-    # Output success info as JSON for parsing
-    result = {{
-        "success": True,
-        "output_path": output_path,
-        "parts": part_info,
-        "total_parts": len(part_info),
-    }}
-    print("FREECAD_RESULT:" + json.dumps(result))
-    
-    # Cleanup
-    FreeCAD.closeDocument(doc.Name)
-
-if __name__ == "__main__":
-    convert_cad_file()
-'''
-    return script
-
-
-# =============================================================================
-# Conversion Result Data
-# =============================================================================
-
-@dataclass
-class ConversionResult:
-    """Result of a FreeCAD conversion operation."""
-    success: bool
-    output_path: Optional[str] = None
-    error_message: Optional[str] = None
-    parts_count: int = 0
-    stderr_output: str = ""
-
-
 # =============================================================================
 # Addon Preferences
 # =============================================================================
 
 class CADImporterPreferences(AddonPreferences):
-    """Addon preferences for CAD Importer."""
-    
     bl_idname = __name__
     
     freecad_path: StringProperty(
-        name="FreeCAD Command Path",
-        description="Path to FreeCADCmd executable. Leave empty for auto-detection",
+        name="FreeCAD Path",
+        description="Path to FreeCADCmd executable",
         subtype='FILE_PATH',
         default="",
     )
     
-    default_quality: EnumProperty(
-        name="Default Quality",
-        description="Default mesh quality preset for imports",
-        items=get_quality_items,
-        default='STANDARD',
-    )
-    
-    show_import_report: BoolProperty(
-        name="Show Import Report",
-        description="Display detailed import statistics after conversion",
-        default=True,
-    )
-    
-    auto_smooth: BoolProperty(
-        name="Auto Smooth Normals",
-        description="Apply smooth shading to imported meshes",
-        default=True,
-    )
-    
-    def draw(self, context: Context) -> None:
+    def draw(self, context):
         layout = self.layout
         
-        # FreeCAD path section
         box = layout.box()
         box.label(text="FreeCAD Configuration", icon='PREFERENCES')
         
@@ -324,31 +128,15 @@ class CADImporterPreferences(AddonPreferences):
         row.prop(self, "freecad_path")
         row.operator("cad_import.detect_freecad", text="", icon='VIEWZOOM')
         
-        # Check if FreeCAD is valid
-        freecad_status = self._check_freecad_status()
-        if freecad_status == "valid":
-            box.label(text="✓ FreeCAD found and ready", icon='CHECKMARK')
-        elif freecad_status == "not_found":
-            box.label(text="✗ FreeCAD not found at specified path", icon='ERROR')
+        # Status indicator
+        if self.freecad_path and os.path.isfile(self.freecad_path):
+            box.label(text="✓ FreeCAD path is valid", icon='CHECKMARK')
+        elif self.freecad_path:
+            box.label(text="✗ File not found at specified path", icon='ERROR')
         else:
-            box.label(text="⚠ Path not set - will attempt auto-detection", icon='INFO')
-        
-        # Default settings
-        box = layout.box()
-        box.label(text="Default Import Settings", icon='IMPORT')
-        box.prop(self, "default_quality")
-        box.prop(self, "show_import_report")
-        box.prop(self, "auto_smooth")
+            box.label(text="⚠ Please set FreeCAD path", icon='INFO')
     
-    def _check_freecad_status(self) -> str:
-        """Check if the configured FreeCAD path is valid."""
-        if not self.freecad_path:
-            return "not_set"
-        if os.path.isfile(self.freecad_path):
-            return "valid"
-        return "not_found"
-    
-    def get_freecad_path(self) -> Optional[str]:
+    def get_freecad_path(self):
         """Get the FreeCAD path, with auto-detection fallback."""
         if self.freecad_path and os.path.isfile(self.freecad_path):
             return self.freecad_path
@@ -357,18 +145,17 @@ class CADImporterPreferences(AddonPreferences):
 
 class CAD_OT_DetectFreeCAD(Operator):
     """Automatically detect FreeCAD installation"""
-    
     bl_idname = "cad_import.detect_freecad"
     bl_label = "Auto-detect FreeCAD"
     bl_options = {'INTERNAL'}
     
-    def execute(self, context: Context) -> Set[str]:
+    def execute(self, context):
         prefs = context.preferences.addons[__name__].preferences
-        detected_path = find_freecad_automatically()
+        detected = find_freecad_automatically()
         
-        if detected_path:
-            prefs.freecad_path = detected_path
-            self.report({'INFO'}, f"Found FreeCAD at: {detected_path}")
+        if detected:
+            prefs.freecad_path = detected
+            self.report({'INFO'}, f"Found FreeCAD: {detected}")
         else:
             self.report({'WARNING'}, "Could not auto-detect FreeCAD. Please set path manually.")
         
@@ -380,33 +167,26 @@ class CAD_OT_DetectFreeCAD(Operator):
 # =============================================================================
 
 class CAD_OT_ImportCAD(Operator, ImportHelper):
-    """Import CAD files (STEP/IGES) using FreeCAD conversion"""
-    
+    """Import CAD files (STEP/IGES) using FreeCAD"""
     bl_idname = "import_scene.cad"
     bl_label = "Import CAD"
     bl_options = {'UNDO', 'PRESET'}
     
-    # File browser filter
     filter_glob: StringProperty(
         default="*.step;*.stp;*.iges;*.igs;*.STEP;*.STP;*.IGES;*.IGS",
         options={'HIDDEN'},
     )
     
-    # Import options
-    quality_preset: EnumProperty(
+    quality: EnumProperty(
         name="Quality",
-        description="Mesh quality preset (affects polygon count and detail)",
-        items=get_quality_items,
+        description="Mesh quality (lower = more detail)",
+        items=[
+            ('DRAFT', "Draft", "Fast preview, low detail (deflection=1.0)"),
+            ('STANDARD', "Standard", "Balanced quality (deflection=0.1)"),
+            ('HIGH', "High", "High detail (deflection=0.01)"),
+            ('ULTRA', "Ultra", "Maximum detail (deflection=0.001)"),
+        ],
         default='STANDARD',
-    )
-    
-    custom_deflection: FloatProperty(
-        name="Custom Deflection",
-        description="Lower values = more detail, higher values = faster. Only used with Custom quality",
-        default=0.1,
-        min=0.0001,
-        max=10.0,
-        precision=4,
     )
     
     scale: FloatProperty(
@@ -417,51 +197,26 @@ class CAD_OT_ImportCAD(Operator, ImportHelper):
         max=10000.0,
     )
     
-    auto_smooth: BoolProperty(
+    smooth_shading: BoolProperty(
         name="Smooth Shading",
         description="Apply smooth shading to imported meshes",
         default=True,
     )
     
-    # Internal state
-    _timer = None
-    _thread: Optional[threading.Thread] = None
-    _result: Optional[ConversionResult] = None
-    _temp_dir: Optional[tempfile.TemporaryDirectory] = None
-    _output_path: Optional[str] = None
+    preserve_hierarchy: BoolProperty(
+        name="Preserve Hierarchy",
+        description="Preserve CAD assembly hierarchy structure",
+        default=True,
+    )
     
-    def invoke(self, context: Context, event) -> Set[str]:
-        # Load defaults from preferences
-        prefs = context.preferences.addons[__name__].preferences
-        self.quality_preset = prefs.default_quality
-        self.auto_smooth = prefs.auto_smooth
-        
-        context.window_manager.fileselect_add(self)
-        return {'RUNNING_MODAL'}
-    
-    def draw(self, context: Context) -> None:
+    def draw(self, context):
         layout = self.layout
-        
-        # Quality settings
-        layout.label(text="Mesh Quality", icon='MESH_DATA')
-        layout.prop(self, "quality_preset", text="")
-        
-        if self.quality_preset == 'CUSTOM':
-            layout.prop(self, "custom_deflection")
-        
-        layout.separator()
-        
-        # Transform settings
-        layout.label(text="Transform", icon='ORIENTATION_GLOBAL')
+        layout.prop(self, "quality")
         layout.prop(self, "scale")
-        
-        layout.separator()
-        
-        # Mesh settings
-        layout.label(text="Mesh Options", icon='NORMALS_FACE')
-        layout.prop(self, "auto_smooth")
+        layout.prop(self, "smooth_shading")
+        layout.prop(self, "preserve_hierarchy")
     
-    def execute(self, context: Context) -> Set[str]:
+    def execute(self, context):
         # Validate file
         filepath = Path(self.filepath)
         if not filepath.exists():
@@ -469,7 +224,7 @@ class CAD_OT_ImportCAD(Operator, ImportHelper):
             return {'CANCELLED'}
         
         if filepath.suffix.lower() not in SUPPORTED_EXTENSIONS:
-            self.report({'ERROR'}, f"Unsupported file format: {filepath.suffix}")
+            self.report({'ERROR'}, f"Unsupported format: {filepath.suffix}")
             return {'CANCELLED'}
         
         # Get FreeCAD path
@@ -477,210 +232,396 @@ class CAD_OT_ImportCAD(Operator, ImportHelper):
         freecad_path = prefs.get_freecad_path()
         
         if not freecad_path:
-            self.report({'ERROR'}, 
-                "FreeCAD not found. Please install FreeCAD or set the path in addon preferences.")
+            self.report({'ERROR'}, "FreeCAD not found. Set path in addon preferences.")
             return {'CANCELLED'}
         
-        # Calculate deflection
-        if self.quality_preset == 'CUSTOM':
-            deflection = self.custom_deflection
-        else:
-            deflection = QUALITY_PRESETS[self.quality_preset][0]
+        # Get deflection from quality preset
+        deflection = QUALITY_PRESETS.get(self.quality, 0.1)
         
         # Set wait cursor
         context.window.cursor_set('WAIT')
         
         try:
-            result = self._run_conversion(freecad_path, str(filepath), deflection)
+            success = self._convert_and_import(
+                context, 
+                freecad_path, 
+                str(filepath), 
+                deflection
+            )
+        except Exception as e:
+            self.report({'ERROR'}, f"Import failed: {e}")
+            return {'CANCELLED'}
         finally:
             context.window.cursor_set('DEFAULT')
         
-        if not result.success:
-            error_msg = result.error_message or "Unknown error"
-            if result.stderr_output:
-                print(f"FreeCAD stderr:\n{result.stderr_output}")
-            self.report({'ERROR'}, f"Conversion failed: {error_msg}")
-            return {'CANCELLED'}
-        
-        # Import the converted file
-        if result.output_path and os.path.exists(result.output_path):
-            try:
-                self._import_mesh(context, result.output_path)
-            except Exception as e:
-                self.report({'ERROR'}, f"Failed to import converted mesh: {e}")
-                return {'CANCELLED'}
+        if success:
+            self.report({'INFO'}, f"Imported: {filepath.name}")
+            return {'FINISHED'}
         else:
-            self.report({'ERROR'}, "Conversion produced no output file")
             return {'CANCELLED'}
-        
-        # Report success
-        prefs = context.preferences.addons[__name__].preferences
-        if prefs.show_import_report:
-            self.report({'INFO'}, 
-                f"Imported {filepath.name}: {result.parts_count} parts")
-        else:
-            self.report({'INFO'}, "CAD file imported successfully")
-        
-        return {'FINISHED'}
     
-    def _run_conversion(
-        self, 
-        freecad_path: str, 
-        input_path: str, 
-        deflection: float
-    ) -> ConversionResult:
-        """Run the FreeCAD conversion subprocess."""
+    def _convert_and_import(self, context, freecad_path, input_path, deflection):
+        """Convert CAD file and import into Blender."""
         
         with tempfile.TemporaryDirectory() as temp_dir:
-            # Determine output format and path
-            output_path = os.path.join(temp_dir, "output.obj")
-            
-            # Generate conversion script
-            script = generate_freecad_script(
-                input_path=input_path,
-                output_path=output_path,
-                deflection=deflection,
-                export_format='OBJ',
-                preserve_hierarchy=True,
-            )
-            
-            # Write script to temp file
+            # Generate FreeCAD script with hierarchy preservation
             script_path = os.path.join(temp_dir, "convert.py")
+            
+            if self.preserve_hierarchy:
+                script = self._generate_hierarchy_script(input_path, temp_dir, deflection)
+            else:
+                script = self._generate_simple_script(input_path, temp_dir, deflection)
+            
+            # Write script
             with open(script_path, 'w', encoding='utf-8') as f:
                 f.write(script)
             
             # Run FreeCAD
+            print(f"Running FreeCAD: {freecad_path}")
+            print(f"Script: {script_path}")
+            
             try:
-                proc = subprocess.run(
+                result = subprocess.run(
                     [freecad_path, script_path],
                     capture_output=True,
                     text=True,
-                    timeout=300,  # 5 minute timeout
+                    timeout=300,
                 )
+                
+                print(f"FreeCAD stdout:\n{result.stdout}")
+                if result.stderr:
+                    print(f"FreeCAD stderr:\n{result.stderr}")
+                print(f"Return code: {result.returncode}")
+                
             except subprocess.TimeoutExpired:
-                return ConversionResult(
-                    success=False,
-                    error_message="Conversion timed out after 5 minutes"
-                )
+                self.report({'ERROR'}, "FreeCAD conversion timed out")
+                return False
             except FileNotFoundError:
-                return ConversionResult(
-                    success=False,
-                    error_message=f"FreeCAD executable not found at: {freecad_path}"
-                )
-            except Exception as e:
-                return ConversionResult(
-                    success=False,
-                    error_message=str(e)
-                )
+                self.report({'ERROR'}, f"FreeCAD not found: {freecad_path}")
+                return False
             
-            # Parse output
-            stdout = proc.stdout or ""
-            stderr = proc.stderr or ""
-            
-            # Check for errors in stderr
-            if "FREECAD_ERROR:" in stderr:
-                error_match = re.search(r"FREECAD_ERROR:\s*(.+)", stderr)
-                error_msg = error_match.group(1) if error_match else "Unknown FreeCAD error"
-                return ConversionResult(
-                    success=False,
-                    error_message=error_msg,
-                    stderr_output=stderr
-                )
-            
-            # Check for success result
-            parts_count = 0
-            if "FREECAD_RESULT:" in stdout:
-                try:
-                    result_match = re.search(r"FREECAD_RESULT:(.+)", stdout)
-                    if result_match:
-                        result_data = json.loads(result_match.group(1))
-                        parts_count = result_data.get("total_parts", 0)
-                        # Update output path if it was changed
-                        output_path = result_data.get("output_path", output_path)
-                except json.JSONDecodeError:
-                    pass
-            
-            # Check if output file exists
-            if not os.path.exists(output_path):
-                return ConversionResult(
-                    success=False,
-                    error_message="Conversion completed but no output file was created",
-                    stderr_output=stderr
-                )
-            
-            # Copy output to a persistent location before temp dir is cleaned
-            import shutil
-            persistent_output = tempfile.mktemp(suffix=".obj")
-            shutil.copy2(output_path, persistent_output)
-            
-            return ConversionResult(
-                success=True,
-                output_path=persistent_output,
-                parts_count=parts_count,
-                stderr_output=stderr
-            )
+            # Import based on mode
+            if self.preserve_hierarchy:
+                return self._import_with_hierarchy(temp_dir)
+            else:
+                return self._import_simple(temp_dir)
     
-    def _import_mesh(self, context: Context, filepath: str) -> None:
-        """Import the converted mesh file into Blender."""
+    def _generate_simple_script(self, input_path, temp_dir, deflection):
+        """Generate FreeCAD script for simple import (single mesh)."""
+        output_path = os.path.join(temp_dir, "output.stl")
         
-        # Store current selection to track new objects
-        before_objects = set(bpy.data.objects)
+        return f'''# FreeCAD conversion script
+import sys
+print("FreeCAD script starting...")
+
+try:
+    import FreeCAD
+    import Part
+    import Mesh
+    import MeshPart
+    print("Modules imported successfully")
+except ImportError as e:
+    print(f"ERROR: Failed to import modules: {{e}}")
+    sys.exit(1)
+
+input_path = {repr(input_path)}
+output_path = {repr(output_path)}
+deflection = {deflection}
+
+print(f"Input: {{input_path}}")
+print(f"Output: {{output_path}}")
+print(f"Deflection: {{deflection}}")
+
+try:
+    print("Reading CAD file...")
+    shape = Part.read(input_path)
+    print(f"Shape loaded: {{shape}}")
+    
+    print("Tessellating...")
+    mesh = Mesh.Mesh(shape.tessellate(deflection))
+    print(f"Mesh created: {{mesh.CountFacets}} faces, {{mesh.CountPoints}} vertices")
+    
+    print("Exporting to STL...")
+    mesh.write(output_path)
+    print("Export complete!")
+    
+except Exception as e:
+    print(f"ERROR: {{e}}")
+    import traceback
+    traceback.print_exc()
+    sys.exit(1)
+
+print("SUCCESS")
+'''
+    
+    def _generate_hierarchy_script(self, input_path, temp_dir, deflection):
+        """Generate FreeCAD script for hierarchical import."""
         
-        # Import based on file extension
-        ext = Path(filepath).suffix.lower()
+        return f'''# FreeCAD hierarchical conversion script
+import sys
+import os
+import json
+print("FreeCAD hierarchical script starting...")
+
+try:
+    import FreeCAD
+    import Part
+    import Mesh
+    import Import
+    print("Modules imported successfully")
+except ImportError as e:
+    print(f"ERROR: Failed to import modules: {{e}}")
+    sys.exit(1)
+
+input_path = {repr(input_path)}
+output_dir = {repr(temp_dir)}
+deflection = {deflection}
+
+print(f"Input: {{input_path}}")
+print(f"Output directory: {{output_dir}}")
+print(f"Deflection: {{deflection}}")
+
+def sanitize_name(name):
+    """Sanitize object name for file system."""
+    import re
+    name = re.sub(r'[<>:"/\\|?*]', '_', name)
+    name = name.strip()
+    return name if name else "unnamed"
+
+def process_object(obj, parent_path="", hierarchy=None, obj_counter=None):
+    """Recursively process objects and build hierarchy."""
+    if hierarchy is None:
+        hierarchy = []
+    if obj_counter is None:
+        obj_counter = {{'count': 0}}
+    
+    obj_name = sanitize_name(obj.Label if hasattr(obj, 'Label') else f"object_{{obj_counter['count']}}")
+    obj_id = f"{{parent_path}}/{{obj_name}}" if parent_path else obj_name
+    
+    print(f"Processing: {{obj_id}}")
+    
+    node = {{
+        'name': obj_name,
+        'id': obj_id,
+        'type': obj.TypeId if hasattr(obj, 'TypeId') else 'Unknown',
+        'children': []
+    }}
+    
+    # Process shape if it exists
+    if hasattr(obj, 'Shape') and obj.Shape and not obj.Shape.isNull():
+        try:
+            obj_counter['count'] += 1
+            filename = f"part_{{obj_counter['count']:04d}}_{{obj_name}}.stl"
+            filepath = os.path.join(output_dir, filename)
+            
+            print(f"  Tessellating shape...")
+            mesh = Mesh.Mesh(obj.Shape.tessellate(deflection))
+            
+            if mesh.CountFacets > 0:
+                print(f"  Writing {{mesh.CountFacets}} faces to {{filename}}")
+                mesh.write(filepath)
+                node['mesh_file'] = filename
+                node['has_geometry'] = True
+            else:
+                print(f"  Skipping empty mesh")
+                node['has_geometry'] = False
+        except Exception as e:
+            print(f"  Warning: Failed to export shape: {{e}}")
+            node['has_geometry'] = False
+    else:
+        node['has_geometry'] = False
+    
+    # Process children
+    if hasattr(obj, 'OutList'):
+        for child in obj.OutList:
+            child_node = process_object(child, obj_id, None, obj_counter)
+            if child_node:
+                node['children'].append(child_node)
+    
+    hierarchy.append(node)
+    return node
+
+try:
+    print("Opening document...")
+    Import.open(input_path)
+    doc = FreeCAD.ActiveDocument
+    
+    if not doc:
+        print("ERROR: No active document")
+        sys.exit(1)
+    
+    print(f"Document opened: {{doc.Name}}")
+    print(f"Objects in document: {{len(doc.Objects)}}")
+    
+    # Build hierarchy
+    hierarchy = []
+    obj_counter = {{'count': 0}}
+    
+    # Process root objects
+    for obj in doc.Objects:
+        # Only process root level objects (not referenced by others)
+        is_root = True
+        for other in doc.Objects:
+            if hasattr(other, 'OutList') and obj in other.OutList:
+                is_root = False
+                break
         
-        if ext == '.obj':
-            bpy.ops.wm.obj_import(filepath=filepath, global_scale=self.scale)
-        elif ext == '.stl':
-            bpy.ops.wm.stl_import(filepath=filepath, global_scale=self.scale)
-        elif ext in ('.glb', '.gltf'):
-            bpy.ops.import_scene.gltf(filepath=filepath)
-            # Apply scale to glTF imports
-            if self.scale != 1.0:
-                for obj in context.selected_objects:
-                    obj.scale *= self.scale
+        if is_root:
+            process_object(obj, "", hierarchy, obj_counter)
+    
+    # Save hierarchy to JSON
+    hierarchy_path = os.path.join(output_dir, "hierarchy.json")
+    with open(hierarchy_path, 'w') as f:
+        json.dump(hierarchy, f, indent=2)
+    
+    print(f"Hierarchy saved: {{hierarchy_path}}")
+    print(f"Total parts exported: {{obj_counter['count']}}")
+    
+    FreeCAD.closeDocument(doc.Name)
+    
+except Exception as e:
+    print(f"ERROR: {{e}}")
+    import traceback
+    traceback.print_exc()
+    sys.exit(1)
+
+print("SUCCESS")
+'''
+    
+    def _import_simple(self, temp_dir):
+        """Import single STL file."""
+        output_path = os.path.join(temp_dir, "output.stl")
         
-        # Find newly imported objects
-        after_objects = set(bpy.data.objects)
-        new_objects = after_objects - before_objects
+        if not os.path.exists(output_path):
+            self.report({'ERROR'}, "Conversion failed - no output file created")
+            return False
+        
+        print(f"Importing STL: {output_path}")
+        
+        # Track new objects
+        before = set(bpy.data.objects)
+        
+        # Import STL
+        bpy.ops.wm.stl_import(filepath=output_path, global_scale=self.scale)
+        
+        # Find new objects
+        after = set(bpy.data.objects)
+        new_objects = after - before
         
         # Apply smooth shading if requested
-        if self.auto_smooth and new_objects:
+        if self.smooth_shading:
             for obj in new_objects:
                 if obj.type == 'MESH':
-                    # Set smooth shading
-                    for polygon in obj.data.polygons:
-                        polygon.use_smooth = True
+                    # Use mesh.shade_smooth() for Blender 4.1+
+                    if hasattr(obj.data, 'shade_smooth'):
+                        obj.data.shade_smooth()
+                    else:
+                        # Fallback for older versions
+                        for poly in obj.data.polygons:
+                            poly.use_smooth = True
         
-        # Clean up temp file
-        try:
-            os.unlink(filepath)
-        except OSError:
-            pass
+        print(f"Imported {len(new_objects)} object(s)")
+        return True
+    
+    def _import_with_hierarchy(self, temp_dir):
+        """Import STL files with hierarchy preservation."""
+        import json
+        
+        hierarchy_path = os.path.join(temp_dir, "hierarchy.json")
+        
+        if not os.path.exists(hierarchy_path):
+            self.report({'ERROR'}, "Hierarchy file not created")
+            return False
+        
+        # Load hierarchy
+        with open(hierarchy_path, 'r') as f:
+            hierarchy = json.load(f)
+        
+        print(f"Loaded hierarchy with {len(hierarchy)} root objects")
+        
+        # Create collection for import
+        filename = Path(self.filepath).stem
+        collection = bpy.data.collections.new(f"CAD_{filename}")
+        bpy.context.scene.collection.children.link(collection)
+        
+        # Import hierarchy recursively
+        def import_node(node, parent_collection):
+            """Recursively import nodes and create hierarchy."""
+            node_collection = None
+            
+            # Import mesh if exists
+            if node.get('has_geometry') and node.get('mesh_file'):
+                mesh_path = os.path.join(temp_dir, node['mesh_file'])
+                
+                if os.path.exists(mesh_path):
+                    # Track existing objects
+                    before = set(bpy.data.objects)
+                    
+                    # Import STL
+                    bpy.ops.wm.stl_import(filepath=mesh_path, global_scale=self.scale)
+                    
+                    # Find new object
+                    after = set(bpy.data.objects)
+                    new_objects = list(after - before)
+                    
+                    if new_objects:
+                        obj = new_objects[0]
+                        obj.name = node['name']
+                        
+                        # Apply smooth shading
+                        if self.smooth_shading and obj.type == 'MESH':
+                            if hasattr(obj.data, 'shade_smooth'):
+                                obj.data.shade_smooth()
+                            else:
+                                for poly in obj.data.polygons:
+                                    poly.use_smooth = True
+                        
+                        # Link to parent collection
+                        # Unlink from all collections first
+                        for coll in obj.users_collection:
+                            coll.objects.unlink(obj)
+                        
+                        parent_collection.objects.link(obj)
+            
+            # Create collection for children if needed
+            if node.get('children'):
+                node_collection = bpy.data.collections.new(node['name'])
+                parent_collection.children.link(node_collection)
+                
+                # Process children
+                for child in node['children']:
+                    import_node(child, node_collection)
+            
+            return node_collection
+        
+        # Import all root nodes
+        for root in hierarchy:
+            import_node(root, collection)
+        
+        print(f"Hierarchy import complete")
+        return True
 
 
 # =============================================================================
-# Drag and Drop File Handler
+# Drag and Drop Handler
 # =============================================================================
 
 class CAD_FH_Import(FileHandler):
-    """File handler for drag-and-drop CAD import."""
-    
     bl_idname = "CAD_FH_import"
     bl_label = "CAD Files"
     bl_import_operator = "import_scene.cad"
     bl_file_extensions = ".step;.stp;.iges;.igs"
     
     @classmethod
-    def poll_drop(cls, context: Context) -> bool:
+    def poll_drop(cls, context):
         return context.area and context.area.type == 'VIEW_3D'
 
 
 # =============================================================================
-# Menu Integration
+# Menu
 # =============================================================================
 
-def menu_func_import(self, context: Context) -> None:
+def menu_func_import(self, context):
     self.layout.operator(CAD_OT_ImportCAD.bl_idname, text="CAD Files (.step/.iges)")
 
 
@@ -695,20 +636,15 @@ classes = (
     CAD_FH_Import,
 )
 
-
-def register() -> None:
+def register():
     for cls in classes:
         bpy.utils.register_class(cls)
-    
     bpy.types.TOPBAR_MT_file_import.append(menu_func_import)
 
-
-def unregister() -> None:
+def unregister():
     bpy.types.TOPBAR_MT_file_import.remove(menu_func_import)
-    
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)
-
 
 if __name__ == "__main__":
     register()
