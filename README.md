@@ -126,18 +126,6 @@ STEP files can contain color data, but conversion via mesh formats may lose this
 - Apply materials manually in Blender
 - Consider the [STEPper addon](https://ambient.gumroad.com/l/stepper) (paid, Windows-only) for direct color support
 
----
-
-## 🆚 Comparison with Alternatives
-
-| Feature | **CAD Importer** (this) | STEPper | SimLab |
-|---------|------------------------|---------|--------|
-| Price | **Free** | €17 | $72/yr |
-| Platform | **Cross-platform** | Windows only | Win/Mac |
-| IGES Support | ✅ | ❌ | ✅ |
-| Dependency | FreeCAD | None | None |
-| Color Support | Partial | ✅ | ✅ |
-| Drag & Drop | ✅ | ❌ | ✅ |
 
 ---
 
