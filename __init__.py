@@ -22,7 +22,7 @@ from bpy.types import Operator, AddonPreferences, FileHandler
 bl_info = {
     "name": "CAD Importer (STEP/IGES)",
     "author": "posthuman",
-    "version": (2, 0, 2),
+    "version": (2, 0, 3),
     "blender": (4, 2, 0),
     "location": "File > Import > CAD Files (.step/.stp/.iges/.igs)",
     "description": "Import CAD STEP and IGES files via FreeCAD",
@@ -297,9 +297,11 @@ class CAD_OT_ImportCAD(Operator, ImportHelper):
                     [freecad_path, "-c", script_path],
                 ]
             else:
-                # Linux/macOS: Usually need -c flag
+                # Linux/macOS: Pass script directly — do NOT use -c flag.
+                # On Linux, freecadcmd -c opens an interactive Python console
+                # after script execution, causing subprocess.run to block
+                # indefinitely until the timeout is reached.
                 commands_to_try = [
-                    [freecad_path, "-c", script_path],
                     [freecad_path, script_path],
                 ]
             
